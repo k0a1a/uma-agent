@@ -50,12 +50,13 @@ GAME_W, GAME_H = 1920, 1080
 TICK_INTERVAL  = 1.5   # seconds between ticks
 
 # HUD regions (left, top, width, height)
-MINIMAP_REGION  = (1666,  65, 207, 200)
-QUEST_REGION    = (1195, 218, 265, 130)
-SUBTITLE_REGION = ( 420, 648, 610,  78)
-CHOICE_REGION   = ( 855, 496, 250, 130)
-INTERACT_REGION = (  55, 350, 230, 120)
-ENEMY_HP_REGION = ( 650,  44, 580,  24)
+MINIMAP_REGION    = (1248,  28, 200, 205)
+MINIMAP_CENTRE_PX = (1348, 130)
+QUEST_REGION      = (1175, 270, 285, 140)
+SUBTITLE_REGION   = ( 130, 648, 1270,  85)  # wide — covers all subtitle positions
+CHOICE_REGION     = ( 855, 498, 595, 125)   # covers both layouts
+INTERACT_REGION   = (  55, 350, 230, 120)   # unchanged, no reference screenshot
+ENEMY_HP_REGION   = ( 650,  44, 580,  24)   # unchanged, no enemies in these shots
 
 # Controller — W3 button mapping
 CONFIRM  = "a"      # interact / select
