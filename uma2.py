@@ -35,8 +35,8 @@ from openai import OpenAI
 
 # ── Service endpoints ─────────────────────────────────────────────────────────
 
-GAME_PC = os.environ.get("GAME_PC", "localhost")
-BEACON  = os.environ.get("BEACON",  "localhost")
+GAME_PC = os.environ.get("GAME_PC", "b550.local")
+BEACON  = os.environ.get("BEACON",  "beacon.x.k0a1a.net")
 
 CONTROLLER_URL = f"http://{GAME_PC}:5002"
 SCREEN_URL     = f"http://{GAME_PC}:5003"

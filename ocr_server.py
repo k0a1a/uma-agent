@@ -15,4 +15,8 @@ def ocr():
     result = reader.readtext(np.array(img), detail=0, paragraph=True)
     return jsonify({"text": " ".join(result).strip()})
 
+@app.route('/health')
+def health():
+    return jsonify({"status": "ok", "service": "ocr"})
+
 app.run(host='0.0.0.0', port=5001)
