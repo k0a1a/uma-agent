@@ -47,13 +47,13 @@ from PIL import Image, ImageEnhance
 # These must match the values in uma0.py.
 # Adjust if crop_*.png images show game world instead of HUD elements.
 
-MINIMAP_REGION    = (1248,  28, 200, 205)
-MINIMAP_CENTRE_PX = (1348, 130)
-QUEST_REGION      = (1175, 270, 285, 140)
-SUBTITLE_REGION   = ( 130, 648, 1270,  85)  # wide — covers all subtitle positions
-CHOICE_REGION     = ( 855, 498, 595, 125)   # covers both layouts
-INTERACT_REGION   = (  55, 350, 230, 120)   # unchanged, no reference screenshot
-ENEMY_HP_REGION   = ( 650,  44, 580,  24)   # unchanged, no enemies in these shots
+MINIMAP_REGION    = (1240,  22, 215, 215)
+MINIMAP_CENTRE_PX = (1347, 129)
+QUEST_REGION      = (1185, 222, 340,  78)
+SUBTITLE_REGION   = ( 400, 650, 700,  55)
+CHOICE_REGION     = ( 870, 500, 420, 125)
+INTERACT_REGION   = (  55, 350, 230, 120)
+ENEMY_HP_REGION   = ( 650,  44, 580,  24)
 
 GAME_W = 1920
 GAME_H = 1080
