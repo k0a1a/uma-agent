@@ -1,84 +1,144 @@
 #!/usr/bin/env python3
 """
-screen_server.py — UMA Game PC screen capture service
-======================================================
-Runs on the game PC. Captures the game screen and serves
-frames to the laptop agent on demand.
+screen_server.py — UMA Game PC screen capture service  (v5: bg capture + WS)
+============================================================================
+Runs on the game PC. Captures the game screen and serves frames to the agent.
+
+What changed from v4:
+  - BACKGROUND CAPTURE THREAD. A dedicated thread grabs the screen continuously
+    into a single "latest frame" buffer. Capture is now OFF the request path:
+    when the agent asks for a frame it gets the freshest one already in memory,
+    instead of waiting for a fresh grab+encode synchronously.
+  - WEBSOCKET frame channel (/ws), request-driven: the agent sends a 1-byte
+    request, the server replies with the latest frame as JPEG bytes. Request-
+    driven (not free-running push) so frames never pile up in the socket buffer
+    and go stale — the agent always pulls the newest available frame.
+  - mss instance is created INSIDE the capture thread. mss is not thread-safe;
+    sharing one instance across threads corrupts captures.
+  - HTTP /screenshot, /region, /health retained for debugging.
 
 Install:
-    pip install flask mss pillow
+    pip install flask flask-sock mss pillow
 
 Run:
     python3 screen_server.py
 
-Endpoints:
-    GET  /screenshot          — full screen as PNG
-    GET  /region?l=&t=&w=&h= — specific region as PNG
-    GET  /health              — connectivity check
+Env:
+    GAME_MONITOR   monitor index (default 1)
+    CAPTURE_FPS    background capture cap (default 30) — trades CPU for freshness
 """
 
-import io
+import io, os, time, threading
 import mss
 from flask import Flask, request, send_file, jsonify
+from flask_sock import Sock
 from PIL import Image
 
-app = Flask(__name__)
-sct = mss.MSS()
+app  = Flask(__name__)
+sock = Sock(app)
 
-GAME_MONITOR = 1   # adjust if game is on second monitor
+GAME_MONITOR = int(os.environ.get("GAME_MONITOR", "1"))
+CAPTURE_FPS  = float(os.environ.get("CAPTURE_FPS", "30"))
 
-print("Screen server starting on 0.0.0.0:5003\n")
+print(f"Screen server starting on 0.0.0.0:5003  (HTTP + WS /ws)")
+print(f"  monitor={GAME_MONITOR}  capture_fps={CAPTURE_FPS}\n")
 
-def capture(region=None) -> Image.Image:
-    raw = sct.grab(sct.monitors[GAME_MONITOR])
-    img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
-    if region:
-        l, t, w, h = region
-        img = img.crop((l, t, l+w, t+h))
-    return img
+# ── Background capture → single latest-frame buffer ───────────────────────────
 
-def img_to_response(img: Image.Image, quality: int = 85):
+_frame_lock = threading.Lock()
+_latest_rgb = None          # PIL.Image (RGB)
+_latest_ts  = 0.0
+_mon_size   = (0, 0)
+
+def _capture_loop():
+    global _latest_rgb, _latest_ts, _mon_size
+    local_sct = mss.mss()                       # thread-local — do NOT share
+    mon = local_sct.monitors[GAME_MONITOR]
+    _mon_size = (mon["width"], mon["height"])
+    period = 1.0 / CAPTURE_FPS if CAPTURE_FPS > 0 else 0.0
+    while True:
+        t0  = time.time()
+        raw = local_sct.grab(mon)
+        img = Image.frombytes("RGB", raw.size, raw.bgra, "raw", "BGRX")
+        with _frame_lock:
+            _latest_rgb = img
+            _latest_ts  = time.time()
+        dt = time.time() - t0
+        if period:
+            time.sleep(max(0.0, period - dt))
+
+threading.Thread(target=_capture_loop, daemon=True).start()
+
+def _get_latest():
+    with _frame_lock:
+        return _latest_rgb, _latest_ts
+
+def _encode_jpeg(img: Image.Image, quality: int) -> bytes:
     buf = io.BytesIO()
-    # use JPEG for speed, PNG for quality
     img.save(buf, format="JPEG", quality=quality)
-    buf.seek(0)
-    return send_file(buf, mimetype="image/jpeg")
+    return buf.getvalue()
+
+# ── WebSocket frame channel ───────────────────────────────────────────────────
+
+@sock.route('/ws')
+def ws(ws):
+    """
+    Request-driven frames. The agent sends any short message to request the
+    latest frame; the server replies with JPEG bytes (binary). Optional text
+    'q=NN' sets JPEG quality for that request (default 85).
+    """
+    while True:
+        req = ws.receive()
+        if req is None:
+            break
+        quality = 85
+        if isinstance(req, str) and req.startswith('q='):
+            try:
+                quality = max(40, min(95, int(req[2:])))
+            except ValueError:
+                pass
+        img, _ts = _get_latest()
+        if img is None:
+            ws.send(b'')                      # not ready yet
+            continue
+        ws.send(_encode_jpeg(img, quality))   # binary frame
+
+# ── HTTP endpoints (debug / fallback) ─────────────────────────────────────────
 
 @app.route('/health')
 def health():
-    mon = sct.monitors[GAME_MONITOR]
+    img, ts = _get_latest()
+    age_ms = int((time.time() - ts) * 1000) if img is not None else -1
     return jsonify({
-        "status":   "ok",
-        "service":  "screen",
-        "monitor":  GAME_MONITOR,
-        "size":     f"{mon['width']}x{mon['height']}",
+        "status":     "ok",
+        "service":    "screen",
+        "monitor":    GAME_MONITOR,
+        "size":       f"{_mon_size[0]}x{_mon_size[1]}",
+        "frame_age_ms": age_ms,
+        "capture_fps":  CAPTURE_FPS,
     })
 
 @app.route('/screenshot')
 def screenshot():
-    """Full screen capture."""
     quality = int(request.args.get('quality', 85))
-    img = capture()
-    return img_to_response(img, quality)
+    img, _ = _get_latest()
+    if img is None:
+        return jsonify({"error": "no frame yet"}), 503
+    return send_file(io.BytesIO(_encode_jpeg(img, quality)), mimetype="image/jpeg")
 
 @app.route('/region')
 def region():
-    """
-    Capture a specific screen region.
-    Params: l (left), t (top), w (width), h (height), quality
-    Example: /region?l=1666&t=65&w=207&h=200
-    """
     try:
-        l = int(request.args['l'])
-        t = int(request.args['t'])
-        w = int(request.args['w'])
-        h = int(request.args['h'])
+        l = int(request.args['l']); t = int(request.args['t'])
+        w = int(request.args['w']); h = int(request.args['h'])
     except (KeyError, ValueError):
         return jsonify({"error": "missing l,t,w,h params"}), 400
-
     quality = int(request.args.get('quality', 90))
-    img = capture(region=(l, t, w, h))
-    return img_to_response(img, quality)
+    img, _ = _get_latest()
+    if img is None:
+        return jsonify({"error": "no frame yet"}), 503
+    crop = img.crop((l, t, l + w, t + h))
+    return send_file(io.BytesIO(_encode_jpeg(crop, quality)), mimetype="image/jpeg")
 
 if __name__ == '__main__':
-    app.run(host='0.0.0.0', port=5003, debug=False)
+    app.run(host='0.0.0.0', port=5003, debug=False, threaded=True)

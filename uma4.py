@@ -126,80 +126,57 @@ def crop(screen: Image.Image, region: tuple) -> Image.Image:
 
 # ── Minimap navigation (pixel-based, no model) ───────────────────────────────
 
-def read_minimap(screen: Image.Image) -> Optional[float]:
-    """
-    Find the nearest white path dot on the minimap and return the angle
-    to it from Geralt's forward direction.
-
-    The minimap rotates with Geralt — top is always his forward.
-    The white arrow at centre is his position.
-
-    Returns:
-      angle in degrees:
-        0   = path dot is directly ahead
-        +90 = path dot is to the right  (positive = rightward)
-        -90 = path dot is to the left   (negative = leftward)
-        180 = path dot is directly behind
-      None if no dots found.
-    """
+def read_minimap(screen: Image.Image):
     mm  = np.array(crop(screen, MINIMAP_REGION))
     h, w = mm.shape[:2]
-    cx, cy = w // 2, h // 2
+    cx, cy = w//2, h//2
 
-    # Isolate white path dots:
-    # - High brightness in all channels
-    # - Neutral (not tinted yellow, green, or brown)
-    r = mm[:,:,0].astype(int)
-    g = mm[:,:,1].astype(int)
-    b = mm[:,:,2].astype(int)
-
+    r,g,b = mm[:,:,0].astype(int), mm[:,:,1].astype(int), mm[:,:,2].astype(int)
     mask = (
-        (r > DOT_BRIGHTNESS) &
-        (g > DOT_BRIGHTNESS) &
-        (b > DOT_BRIGHTNESS) &
-        (np.abs(r - g) < DOT_CHANNEL_MAX) &
-        (np.abs(g - b) < DOT_CHANNEL_MAX) &
-        (np.abs(r - b) < DOT_CHANNEL_MAX)
+        (r > DOT_BRIGHTNESS) & (g > DOT_BRIGHTNESS)
     ).astype(np.uint8) * 255
-
-    # Remove Geralt's arrow at centre
-    cv2.circle(mask, (cx, cy), DOT_EXCLUDE_R, 0, -1)
-
-    # Remove minimap border rim (also white/gold)
+    cv2.circle(mask, (cx,cy), DOT_EXCLUDE_R, 0, -1)
     border = np.zeros_like(mask)
-    cv2.circle(border, (cx, cy), min(cx, cy) - DOT_BORDER_PAD, 255, -1)
+    cv2.circle(border, (cx,cy), min(cx,cy)-DOT_BORDER_PAD, 255, -1)
     mask = cv2.bitwise_and(mask, border)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2,2), np.uint8))
 
-    # Remove single-pixel noise
-    kernel = np.ones((2, 2), np.uint8)
-    mask   = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel)
+    num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask)
+    filtered = np.zeros_like(mask)
+    for i in range(1, num_labels):
+        if 1 <= stats[i, cv2.CC_STAT_AREA] <= 15:
+            filtered[labels==i] = 255
+    mask = filtered
+
+    Image.fromarray(mm).save("minimap_raw.png")
+    Image.fromarray(mask).save("minimap_mask.png")
 
     ys, xs = np.where(mask > 0)
-    if len(xs) < 3:
-        return None
+    if len(xs) >= 3:
+        distances = np.sqrt((xs-cx)**2 + (ys-cy)**2)
+        far = distances > DOT_EXCLUDE_R
+        if far.sum() >= 3:
+            idx = distances[far].argmin()
+            tx, ty = int(xs[far][idx]), int(ys[far][idx])
+            angle = math.degrees(math.atan2(tx-cx, -(ty-cy)))
+            return angle, "path"
 
-    # Find nearest dot outside the exclusion zone
-    distances  = np.sqrt((xs - cx)**2 + (ys - cy)**2)
-    far_enough = distances > DOT_EXCLUDE_R
+    Image.fromarray(mm).save("minimap_debug.png")
 
-    if far_enough.sum() < 3:
-        return None
+    # Fall back to yellow quest marker
+    hsv = cv2.cvtColor(mm, cv2.COLOR_RGB2HSV)
+    ymask = cv2.inRange(hsv,
+                        np.array([15, 150, 150]),
+                        np.array([35, 255, 255]))
+    cv2.circle(ymask, (cx,cy), DOT_EXCLUDE_R, 0, -1)
+    ymask = cv2.bitwise_and(ymask, border)
+    yys, yxs = np.where(ymask > 0)
+    if len(yxs) >= 3:
+        tx, ty = int(yxs.mean()), int(yys.mean())
+        angle = math.degrees(math.atan2(tx-cx, -(ty-cy)))
+        return angle, "marker"
 
-    idx    = distances[far_enough].argmin()
-    tx, ty = int(xs[far_enough][idx]), int(ys[far_enough][idx])
-
-    # Angle from Geralt's forward (up = 0°, clockwise positive)
-    # atan2(x_offset, -y_offset) gives 0 at top, +90 at right
-    angle = math.degrees(math.atan2(tx - cx, -(ty - cy)))
-
-    # Save debug image
-    debug = mm.copy()
-    debug[mask > 0] = [255, 50, 50]          # mark detected dots red
-    cv2.circle(debug, (tx, ty), 6, (0,255,0), 2)   # green circle on target
-    cv2.circle(debug, (cx, cy), 3, (0,0,255), -1)  # blue dot at centre
-    Image.fromarray(debug).save("minimap_debug.png")
-
-    return angle
+    return None, "none"
 
 def angle_to_sticks(angle: float) -> Tuple[float, float]:
     """
@@ -241,16 +218,18 @@ def detect_mode(screen: Image.Image) -> str:
     # CHOICES — dark box with bright text
     l,t,w,h = CHOICE_REGION
     cg = cv2.cvtColor(arr[t:t+h, l:l+w], cv2.COLOR_RGB2GRAY)
+    choices_text = ocr(crop(screen, CHOICE_REGION))
     if ((cg>160).sum()/cg.size > 0.04 and
         ((cg>15)&(cg<90)).sum()/cg.size > 0.15 and
-        cg.mean() < 85):
+        cg.mean() < 85 and
+        len(choices_text) > 10):
         return "CHOICES"
 
-    # DIALOGUE
-    l,t,w,h = SUBTITLE_REGION
-    sg = cv2.cvtColor(arr[t:t+h, l:l+w], cv2.COLOR_RGB2GRAY)
-    if (sg>160).sum() > 200 and sg.mean() < 130:
-        return "DIALOGUE"
+    # DIALOGUE disabled during navigation testing
+    # l,t,w,h = SUBTITLE_REGION
+    # sg = cv2.cvtColor(arr[t:t+h, l:l+w], cv2.COLOR_RGB2GRAY)
+    # if (sg>160).sum() > 800 and sg.mean() < 110:
+    #     return "DIALOGUE"
 
     # COMBAT
     l,t,w,h = ENEMY_HP_REGION
@@ -312,8 +291,8 @@ def move(rs_x: float, ls_y: float, duration: float = MOVE_DURATION):
     Left stick X is always 0 — no diagonal, no strafe.
     """
     _post("/navigate", {
-        "left_x":   0.0,    # never use left stick X
-        "left_y":   ls_y,
+        "left_x":   0.0,
+        "left_y":  -ls_y,   # W3 inverts Y — negative = forward
         "right_x":  rs_x,
         "right_y":  0.0,
         "duration": duration,
@@ -349,11 +328,11 @@ class StuckDetector:
     def recover(self):
         self.still = 0
         self.frames.clear()
-        # Back up while rotating camera to clear obstacle
-        steer = random.choice([-0.7, 0.7])
-        print(f"  ⚠  stuck (ssim={self.last:.3f}) — back + steer {steer:+.1f}")
-        move(rs_x=steer, ls_y=-1.0, duration=0.8)
-        time.sleep(0.1)
+        steer = random.choice([-1.0, 1.0])
+        print(f"  ⚠  stuck (ssim={self.last:.3f}) — rotating + forward")
+        move(rs_x=steer, ls_y=0.0, duration=0.6)
+        time.sleep(0.2)
+        move(rs_x=0.0, ls_y=1.0, duration=0.5)
 
     def reset(self):
         self.still = 0
@@ -425,9 +404,10 @@ def run():
         time.sleep(1)
     print("UMA v4.0 running.  Ctrl-C to stop.\n")
 
-    tick      = 0
-    last_mode = ""
-    post_load = False
+    tick          = 0
+    last_mode     = ""
+    post_load     = False
+    recent_angles = deque(maxlen=4)
 
     while True:
         tick += 1
@@ -472,13 +452,13 @@ def run():
             time.sleep(2)
             continue
 
-        # ── Dialogue ───────────────────────────────────────────────────────
-        if mode == "DIALOGUE":
-            sub = ocr(crop(screen, SUBTITLE_REGION))
-            print(f"  💬 '{sub}'")
-            button("a")
-            time.sleep(max(0, TICK_INTERVAL - (time.time()-t0)))
-            continue
+        # DIALOGUE disabled
+        # if mode == "DIALOGUE":
+        #     sub = ocr(crop(screen, SUBTITLE_REGION))
+        #     print(f"  💬 '{sub}'")
+        #     button("a")
+        #     time.sleep(max(0, TICK_INTERVAL - (time.time()-t0)))
+        #     continue
 
         # ── Choices ────────────────────────────────────────────────────────
         if mode == "CHOICES":
@@ -509,6 +489,14 @@ def run():
         # ── Exploration ────────────────────────────────────────────────────
         if mode == "EXPLORATION":
 
+            # Reorient camera when returning from another mode
+            if last_mode != "EXPLORATION":
+                angle, _ = read_minimap(screen)
+                if angle is not None and abs(angle) > 30:
+                    print(f"  📷 reorienting camera ({angle:+.1f}°)")
+                    move(rs_x=math.sin(math.radians(angle)), ls_y=0.0, duration=0.5)
+                    time.sleep(0.3)
+
             # Stuck check
             sd.record(screen)
             if sd.is_stuck():
@@ -525,15 +513,21 @@ def run():
                 continue
 
             # Read minimap angle
-            angle = read_minimap(screen)
+            angle, source = read_minimap(screen)
 
             if angle is not None:
+                recent_angles.append(abs(angle))
+                if len(recent_angles) == 4 and all(a > 140 for a in recent_angles):
+                    print(f"  📷 camera flipped — correcting")
+                    move(rs_x=1.0, ls_y=0.0, duration=0.7)
+                    time.sleep(0.3)
+                    recent_angles.clear()
+                    continue
                 rs_x, ls_y = angle_to_sticks(angle)
-                print(f"  🗺  {angle:+.1f}°  →  RS {rs_x:+.2f}  LS {ls_y:.2f}")
+                print(f"  🗺  {angle:+.1f}° [{source}]  →  RS {rs_x:+.2f}  LS {ls_y:.2f}")
             else:
                 rs_x, ls_y = 0.0, 1.0
                 print(f"  🗺  no path — forward")
-
             move(rs_x=rs_x, ls_y=ls_y, duration=MOVE_DURATION)
 
             elapsed = time.time() - t0
