@@ -108,6 +108,9 @@ GOLD_MAX_BBOX   = 45          # reject gold spans wider than this (arc / rim fra
 GOLD_SWITCH_RATIO = 1.5       # temporal coherence (Fix 2): switch off the tracked gold
                               # blob only if another is this× bigger — else hold, so the
                               # destination diamond and a quest icon stop flip-flopping
+GOLD_TRUST_MIN_FRAC = 0.15    # within this × minimap-radius the marker is ~on top of us
+                              # and its BEARING is noise (wild swings / 180° flips), so we
+                              # stop steering by it and let the latch + arrival take over
 
 # ── Steering law — LEFT-STICK DIRECTIONAL + NEAR-FIELD HEADING ────────────────
 # Heading is the direction of the IMMEDIATE path dots around Geralt, resolved
@@ -128,6 +131,17 @@ HEADING_EMA     = 0.40    # vector smoothing on heading (sin/cos, wrap-safe)
 SPEED_FLOOR     = 0.50    # keep moving while turning (never pirouette in place)
 DEBUG_EVERY     = 3       # write minimap debug PNGs every N ticks (0 = never)
 INTERACT_EVERY  = 3       # run the interact-prompt OCR every N ticks (latency)
+DIALOGUE_ENABLE = os.environ.get("DIALOGUE", "0") not in ("0", "false", "")
+                          # OFF by default for now: suppresses interact-prompt 'A' presses
+                          # and CHOICES dialogue selection so navigation testing can't be
+                          # derailed by spurious key presses on garbage OCR. DIALOGUE=1 re-enables.
+DISTANCE_ENABLE = os.environ.get("DISTANCE", "1") not in ("0", "false", "")
+DISTANCE_EVERY  = 5       # OCR the objective-distance counter every N ticks (it changes slowly,
+                          # and it's read-only, so this stays cheap and off the per-tick path)
+DISTANCE_MAX        = 5000  # m; reject reads above this as OCR garbage
+DISTANCE_MAX_JUMP   = 60    # m; a one-off read jumping more than this from last-good is a glitch...
+DISTANCE_CONFIRM_TOL = 15   # ...unless a consecutive read confirms it (a real objective change)
+DISTANCE_STALE      = 4     # drop last-good after this many failed reads (then return None)
 
 # ── Navigation source ─────────────────────────────────────────────────────────
 # "pixel": gold destination marker (primary) + decluttered dotted trail (fallback).
@@ -179,6 +193,11 @@ SUBTITLE_REGION = ( 450, 655, 570,  55)
 CHOICE_REGION   = ( 865, 500, 360, 125)
 INTERACT_REGION = (  55, 350, 230, 120)
 ENEMY_HP_REGION = ( 650,  44, 580,  24)
+# Objective-distance (footprints) counter, just below-left of the minimap. A tight
+# box around the DIGITS only — clear of the 'CLEAR' weather box and sun/moon dial
+# (both upper-left). CALIBRATE with distance_raw.png and confirm the number DECREASES
+# as Geralt approaches; if it's static it's the Crowns counter, not distance — move it.
+DISTANCE_REGION = (1500, 204,  100,  30)    # STARTING GUESS @1920×1080
 
 # ── Auto-scale minimap-pixel constants to the configured minimap size ──────────
 # The dot/gold geometry above was tuned at a 213-px minimap. Scaling by the actual
@@ -267,7 +286,31 @@ ARRIVAL_NEAR_FRAC   = 0.15   # marker this close (still drawn) = arrived outrigh
 ARRIVAL_RESUME_FRAC = 0.55   # a marker beyond this (post-arrival) = new objective → resume
 ARRIVAL_CONFIRM     = 4       # consecutive confirming ticks before declaring arrival
 ARRIVAL_MAX_DOTS    = 4       # near-dot count at/below which the trail counts as "gone"
+# Metre thresholds (preferred when the objective-distance OCR is available — it's the
+# game's own ground-truth distance, with none of the rim-clamp / centre-jitter
+# pathologies of the gold-pixel geometry). Pixel fracs above are the fallback.
+ARRIVAL_DIST_M      = 5       # arrived within this many metres of the objective
+ARRIVAL_ZONE_M      = 15      # within this we've "seen close" (arms the arrival)
+ARRIVAL_RESUME_M    = 30      # beyond this after arriving = a new objective → resume
 _MM_R = min(MINIMAP_REGION[2], MINIMAP_REGION[3]) / 2.0   # minimap usable radius (px)
+GOLD_TRUST_MIN_DIST = GOLD_TRUST_MIN_FRAC * _MM_R         # px; below this the bearing is noise
+
+# ── Progress detection (viewport-independent stall) ───────────────────────────
+# The edge viewport is blind to low-contrast / horizontal-edged walls (a shadowed
+# log cabin reads as 'clear'), and because it reads clear neither the live-lock
+# counter (keyed on the viewport's blocked flag) nor full-frame SSIM (defeated by
+# idle animation + foliage) fires — Geralt can press a wall indefinitely. So we also
+# watch the gold marker's RADIAL distance: rotation-invariant (a weave can't fool
+# it), and if it stops decreasing while we steer straight at the marker, we're
+# blocked regardless of what the viewport thinks. Recovery is reverse+sidestep —
+# never the viewport widest-gap, whose histogram is poisoned by the same blind spot.
+# Active only on gold/latch steering (no trail): while following a trail the route
+# may legitimately curve away from the marker, so we don't second-guess it.
+PROGRESS_WINDOW     = 15    # ticks of gold/latch steering examined for closure
+PROGRESS_EPS        = 6.0   # px; must close at least this much over the window, else stalled
+PROGRESS_RANGE      = 10.0  # px; if the distance also varied less than this it barely moved
+                            # (flat = wall press); a detour has a large range and is spared
+PROGRESS_CLAMP_FRAC = 0.80  # ignore a rim-clamped far marker (its distance saturates there)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Transport: WebSocket clients with lazy reconnect
@@ -527,9 +570,19 @@ def path_heading(screen: Image.Image, prev_heading, save: bool = False):
     _last_gold_dist = (math.hypot(gold_pt[0] - origin[0], gold_pt[1] - origin[1])
                        if gold_pt is not None else None)
 
-    # Maintain the gold latch: refresh on sight, otherwise age it out.
-    if gold_ang is not None:
-        _gold_latch_ang, _gold_latch_age = gold_ang, 0
+    # Distance-gate the BEARING. Within GOLD_TRUST_MIN_DIST of centre the marker is
+    # only a few px off-centre, so its ANGLE is noise — tiny centroid jitter swings it
+    # wildly and flips it ~180° across centre (the corner-orbit failure). We keep the
+    # distance (arrival relies on it) but suppress the bearing so we don't steer by it:
+    # the latch (last trustworthy bearing, decaying to straight) walks us in and
+    # arrival stops us on the spot.
+    gold_trusted = (gold_ang is not None and _last_gold_dist is not None
+                    and _last_gold_dist >= GOLD_TRUST_MIN_DIST)
+    gold_use = gold_ang if gold_trusted else None
+
+    # Maintain the gold latch: refresh on a TRUSTED sight, otherwise age it out.
+    if gold_use is not None:
+        _gold_latch_ang, _gold_latch_age = gold_use, 0
     elif _gold_latch_ang is not None:
         _gold_latch_age += 1
         if _gold_latch_age > GOLD_LATCH_TICKS:
@@ -553,7 +606,7 @@ def path_heading(screen: Image.Image, prev_heading, save: bool = False):
     #    NEAR THE DESTINATION, where the gold diamond becomes the target icon and
     #    the dots go sparse) must NOT pre-empt gold/latch, so it defers (Fix 3).
     if len(near) >= MIN_DOTS_FOR_HEADING:
-        h_n, c_n, near_kept = _trail_dir(near, origin, prev_heading, gold_ang)
+        h_n, c_n, near_kept = _trail_dir(near, origin, prev_heading, gold_use)
         if c_n >= CONC_MIN:
             heading, conc, near, src = h_n, c_n, near_kept, "path"
 
@@ -561,16 +614,16 @@ def path_heading(screen: Image.Image, prev_heading, save: bool = False):
     #      latch, then a wider whole-map trail read, then whatever scattered dots
     #      remain (untrusted → the loop holds the last heading).
     if src != "path":
-        if gold_ang is not None:
-            heading, conc, src = gold_ang, 1.0, "gold"           # direct bearing
+        if gold_use is not None:
+            heading, conc, src = gold_use, 1.0, "gold"           # direct bearing
         elif _gold_latch_ang is not None:                        # near destination: latch
             decay = math.exp(-_gold_latch_age / GOLD_LATCH_TAU)  # turn-then-straighten
             heading, conc, src = _gold_latch_ang * decay, 1.0, "latch"
         elif len(alld) >= MIN_DOTS_FOR_HEADING:                  # wider trail fallback
-            heading, conc, near = _trail_dir(alld, origin, prev_heading, gold_ang)
+            heading, conc, near = _trail_dir(alld, origin, prev_heading, gold_use)
             src = "path" if conc >= CONC_MIN else "spread"
         elif len(near) >= 2:                                     # last resort: hold on it
-            heading, conc, near = _trail_dir(near, origin, prev_heading, gold_ang)
+            heading, conc, near = _trail_dir(near, origin, prev_heading, gold_use)
             src = "spread"
         elif len(near) == 1:
             heading, conc, src = _ang(origin, near[0]), 1.0, "one"
@@ -1003,7 +1056,32 @@ class ArrivalDetector:
         self.R = mm_radius
         self.reset()
 
-    def update(self, gold_dist: Optional[float], n_near: int) -> bool:
+    def update(self, gold_dist: Optional[float], n_near: int,
+               dist_m: Optional[float] = None) -> bool:
+        # Prefer the game's objective distance in metres when available (clean scalar,
+        # no rim-clamp, no centre-jitter); fall back to the gold-pixel geometry.
+        if dist_m is not None:
+            return self._update_m(dist_m)
+        return self._update_px(gold_dist, n_near)
+
+    def _update_m(self, d: float) -> bool:
+        if self.arrived:
+            if d > ARRIVAL_RESUME_M:                 # new objective further out → resume
+                self.reset()
+                return False
+            return True
+        if d <= ARRIVAL_ZONE_M:
+            self.seen_close = True
+        if d > ARRIVAL_RESUME_M:                     # marker jumped far → not arrival
+            self.reset()
+            return False
+        cond = self.seen_close and d <= ARRIVAL_DIST_M
+        self.confirm = self.confirm + 1 if cond else 0
+        if self.confirm >= ARRIVAL_CONFIRM:
+            self.arrived = True
+        return self.arrived
+
+    def _update_px(self, gold_dist: Optional[float], n_near: int) -> bool:
         near_r   = ARRIVAL_NEAR_FRAC   * self.R
         zone_r   = ARRIVAL_RADIUS_FRAC * self.R
         resume_r = ARRIVAL_RESUME_FRAC * self.R
@@ -1038,6 +1116,101 @@ class ArrivalDetector:
         self.arrived    = False
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Progress detection — catch wall-presses the viewport and SSIM both miss
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ProgressDetector:
+    """Viewport-INDEPENDENT stall check. Edge-based viewport perception is blind to
+    low-contrast / horizontal-edged walls (a shadowed log cabin), so it reports
+    'clear' while Geralt presses one; the live-lock counter (keyed on that flag)
+    can't fire, and full-frame SSIM is defeated by idle animation + swaying foliage.
+    We watch the gold marker's RADIAL distance instead — rotation-invariant, so a
+    weave can't fool it. If it isn't closing while we steer straight at the marker,
+    we're blocked. Active only on gold/latch steering with no trail (open-ground
+    straight approach); while following a trail the route may legitimately curve
+    away from the marker, which removes the detour false-positive."""
+
+    def __init__(self):
+        self.dists = deque(maxlen=PROGRESS_WINDOW)
+        self.side  = 1.0
+
+    def record(self, gold_dist: Optional[float], source: str, mm_radius: float):
+        if source not in ("gold", "latch") or gold_dist is None \
+           or gold_dist > PROGRESS_CLAMP_FRAC * mm_radius:
+            self.dists.clear()
+            return
+        self.dists.append(gold_dist)
+
+    def stalled(self) -> bool:
+        if len(self.dists) < PROGRESS_WINDOW:
+            return False
+        net   = self.dists[0] - self.dists[-1]           # >0 = net closer over the window
+        rng   = max(self.dists) - min(self.dists)        # how much it moved at all
+        # Stalled = didn't get meaningfully closer AND barely moved. The range term
+        # rejects a legitimate detour (distance rises then falls — large range, he IS
+        # translating); the net term lets slow-but-steady real progress through.
+        return net < PROGRESS_EPS and rng < PROGRESS_RANGE
+
+    def recover(self) -> float:
+        """Reverse off the wall, then sidestep along it, alternating sides on repeat.
+        Deliberately NOT the viewport widest-gap — its histogram is blind to this wall,
+        so it would just steer us back into it."""
+        self.dists.clear()
+        self.side = -self.side
+        tag = "R" if self.side > 0 else "L"
+        print(f"  🧱 NO PROGRESS (gold not closing) — reverse + sidestep {tag}")
+        move_dir(180.0, 0.70);            time.sleep(0.35)   # back off the wall
+        move_dir(self.side * 90.0, 0.90); time.sleep(0.40)   # sidestep along it
+        release()
+        return self.side
+
+    def reset(self):
+        self.dists.clear()
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Objective-distance reader — OCR the footprints/step counter, validated
+# ══════════════════════════════════════════════════════════════════════════════
+
+class DistanceReader:
+    """Reads the objective distance (metres) from the HUD step counter. This is the
+    game's own ground-truth proximity — no rim-clamp, no centre-jitter, a clean scalar
+    with no angle to flip — so it's the preferred proximity gauge for arrival. But it's
+    a small stylised HUD number next to a footprints glyph, so a raw OCR read is a
+    liability (we watched the interact OCR hallucinate 'Wuegoue'); a bad read here could
+    fake an arrival. So every read is validated: digits only, plausibility ceiling, a
+    one-off large jump is rejected as a glitch unless a consecutive read confirms it (a
+    real objective change), and last-good is held across brief failures."""
+
+    def __init__(self):
+        self.reset()
+
+    def read(self, screen: Image.Image) -> Optional[int]:
+        raw    = ocr(crop(screen, DISTANCE_REGION))
+        digits = "".join(c for c in raw if c.isdigit())
+        self.age += 1
+        val = int(digits) if digits else None
+
+        if val is None or not (0 < val <= DISTANCE_MAX):
+            self.pending = None
+            return self.last if self.age <= DISTANCE_STALE else None
+
+        if self.last is None or abs(val - self.last) <= DISTANCE_MAX_JUMP:
+            self.last, self.age, self.pending = val, 0, None     # plausible: trust
+            return val
+
+        # large jump: glitch unless a consecutive read confirms it (real change)
+        if self.pending is not None and abs(val - self.pending) <= DISTANCE_CONFIRM_TOL:
+            self.last, self.age, self.pending = val, 0, None
+            return val
+        self.pending = val
+        return self.last if self.age <= DISTANCE_STALE else None
+
+    def reset(self):
+        self.last    = None       # last trusted distance (m), or None
+        self.age     = 999        # reads since last good (for staleness)
+        self.pending = None       # a big-jump candidate awaiting confirmation
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Startup checks
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -1070,6 +1243,8 @@ def check_services() -> bool:
 def run():
     sd = StuckDetector()
     arrival = ArrivalDetector(_MM_R)
+    progress = ProgressDetector()
+    dist_reader = DistanceReader()
 
     print("UMA v8.0 — checking services...")
     if not check_services():
@@ -1085,6 +1260,8 @@ def run():
     print("Obstacle avoidance: " + (f"VIEWPORT (VFH, FOV {VIEW_FOV_DEG:.0f}°, "
           f"{N_SECTORS} sectors) — calibrate VIEWPORT_REGION via viewport_annotated.png"
           if VIEWPORT_AVOID else "OFF (trail + SSIM recovery only)"))
+    print("Dialogue/interact: " + ("ENABLED" if DIALOGUE_ENABLE
+          else "DISABLED (no key presses on prompts/choices — DIALOGUE=1 to enable)"))
 
     print(f"All services OK.  Starting in 5s — W3 must be running on {GAME_PC}...\n")
     for i in range(5, 0, -1):
@@ -1129,6 +1306,7 @@ def run():
         if mode != "EXPLORATION" and last_mode == "EXPLORATION":
             release()
             arrival.reset()        # re-evaluate arrival fresh on the next exploration entry
+            progress.reset()
 
         # ── Loading ────────────────────────────────────────────────────────
         if mode == "LOADING":
@@ -1145,7 +1323,7 @@ def run():
 
         if post_load and last_mode == "LOADING":
             print("  ✅ loaded — pausing 2s")
-            time.sleep(2); sd.reset(); arrival.reset(); post_load = False
+            time.sleep(2); sd.reset(); arrival.reset(); progress.reset(); dist_reader.reset(); post_load = False
 
         # ── Cutscene ───────────────────────────────────────────────────────
         if mode == "CUTSCENE":
@@ -1153,6 +1331,12 @@ def run():
 
         # ── Choices ────────────────────────────────────────────────────────
         if mode == "CHOICES":
+            if not DIALOGUE_ENABLE:
+                release()
+                print("  💬 CHOICES — dialogue disabled, holding (DIALOGUE=1 to enable)")
+                last_mode = mode
+                time.sleep(max(0, TICK - (time.time() - t0)))
+                continue
             quest   = ocr(crop(screen, QUEST_REGION))
             ch_img  = crop(screen, CHOICE_REGION)
             ch_txt  = ocr(ch_img)
@@ -1206,13 +1390,24 @@ def run():
             bias = edge_bias
             edge_ticks -= 1
 
-        # Interact prompt — gated to every Nth tick (OCR is a beacon round-trip)
-        if tick % INTERACT_EVERY == 0:
+        # Interact prompt — gated to every Nth tick (OCR is a beacon round-trip).
+        # Off when DIALOGUE_ENABLE is false: no A presses, and the OCR round-trip is
+        # skipped entirely (also steadies the tick time).
+        if DIALOGUE_ENABLE and tick % INTERACT_EVERY == 0:
             interact = ocr(crop(screen, INTERACT_REGION))
             if interact.strip():
                 print(f"  💬 '{interact}' → A")
                 release(); button("a"); time.sleep(0.4)
                 continue
+
+        # Objective distance (metres) — read-only OCR of the step counter, gated to
+        # every Nth tick (it changes slowly). The validated reader holds last-good, so
+        # dist_m is usable every tick for proximity decisions.
+        if DISTANCE_ENABLE and tick % DISTANCE_EVERY == 0:
+            dist_reader.read(screen)
+            if DEBUG_EVERY and tick % DEBUG_EVERY == 0:
+                crop(screen, DISTANCE_REGION).save("distance_raw.png")  # calibrate the box
+        dist_m = dist_reader.last if DISTANCE_ENABLE else None
 
         # ── 1. Desired heading from navigation (trail or VLM) ────────────────
         if NAV_MODE == "vlm":
@@ -1231,14 +1426,28 @@ def run():
                 save=(DEBUG_EVERY and tick % DEBUG_EVERY == 0))
 
             # ── Arrival — stop before overshooting the destination ───────────
-            # _last_gold_dist (radial px to the marker, None if gone) was just set
-            # by path_heading. Once arrived we release and hold; resume is handled
-            # inside the detector (new far marker or a returning trail).
-            if ARRIVAL_ENABLE and arrival.update(_last_gold_dist, n_near):
+            # Prefer the metre distance (clean); _last_gold_dist is the pixel fallback.
+            # Once arrived we release and hold; resume is handled inside the detector.
+            if ARRIVAL_ENABLE and arrival.update(_last_gold_dist, n_near, dist_m):
                 release()
                 sm_sin = sm_cos = None                       # drop heading so we don't lurch on resume
-                gd = f"{_last_gold_dist:.0f}px" if _last_gold_dist is not None else "gone"
-                print(f"  🎯 ARRIVED — holding (gold {gd}, dots {n_near})")
+                gd = (f"{dist_m}m" if dist_m is not None
+                      else (f"{_last_gold_dist:.0f}px" if _last_gold_dist is not None else "gone"))
+                print(f"  🎯 ARRIVED — holding ({gd}, dots {n_near})")
+                last_mode = mode
+                time.sleep(max(0, TICK - (time.time() - t0)))
+                continue
+
+            # ── Progress — viewport-independent stall check ──────────────────
+            # Gold radial distance not closing while steering at the marker = blocked,
+            # even when the viewport reports clear (it's blind to this wall). Recover
+            # by reversing + sidestepping, then arc around via the edge bias.
+            progress.record(_last_gold_dist, source, _MM_R)
+            if progress.stalled():
+                side = progress.recover()
+                edge_bias, edge_ticks = side * EDGE_BIAS_DEG, EDGE_BIAS_TICKS
+                sm_sin = sm_cos = None
+                blocked_streak = 0
                 last_mode = mode
                 time.sleep(max(0, TICK - (time.time() - t0)))
                 continue
@@ -1306,7 +1515,8 @@ def run():
         vp_str = ("" if not VIEWPORT_AVOID else
                   f"  ⛞{vp_src} Δ{defl:+.0f}° clr={clearance:.2f}"
                   + (" BLOCK" if blocked_ahead else ""))
-        print(f"  🗺  heading {heading:+.1f}° ({nav_str}{eb}){vp_str}  →  spd {speed:.2f}")
+        dm_str = f"  📏{dist_m}m" if dist_m is not None else ""
+        print(f"  🗺  heading {heading:+.1f}° ({nav_str}{eb}){vp_str}{dm_str}  →  spd {speed:.2f}")
         move_dir(heading, speed)
 
         elapsed = time.time() - t0
