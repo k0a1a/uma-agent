@@ -230,6 +230,24 @@ BLOCK_FLOOR      = 0.06     # ...but never below this absolute (normalised 0..1)
 AVOID_CONE_DEG   = 55.0     # most we'll deflect to dodge (never steer ~backwards)
 SLOW_ON_BLOCK    = 0.45     # speed × this while squeezing past / boxed in
 
+# ── Arrival detection (stop instead of overshooting the destination) ──────────
+# The gold marker's RADIAL distance from the minimap centre shrinks as we approach
+# (radial = rotation-invariant, like the latch bearing). Very close, the diamond is
+# replaced by the destination icon — gold detection returns nothing — and the trail
+# dots go sparse. We declare ARRIVAL only after the marker has been CLOSE (entered
+# the arrival zone) and THEN reads very-near, or vanishes with no trail, for a few
+# ticks. The "must have been close first" gate stops a marker merely occluded
+# mid-field (or a far rim-clamped target) from triggering arrival. On arrival we
+# release the stick and hold; a NEW far marker OR a returning trail (next objective)
+# resumes navigation. Interaction at the spot stays with the interact-prompt path.
+ARRIVAL_ENABLE      = os.environ.get("ARRIVAL", "1") not in ("0", "false", "")
+ARRIVAL_RADIUS_FRAC = 0.30   # marker within this × minimap-radius = in the arrival zone
+ARRIVAL_NEAR_FRAC   = 0.15   # marker this close (still drawn) = arrived outright
+ARRIVAL_RESUME_FRAC = 0.55   # a marker beyond this (post-arrival) = new objective → resume
+ARRIVAL_CONFIRM     = 4       # consecutive confirming ticks before declaring arrival
+ARRIVAL_MAX_DOTS    = 4       # near-dot count at/below which the trail counts as "gone"
+_MM_R = min(MINIMAP_REGION[2], MINIMAP_REGION[3]) / 2.0   # minimap usable radius (px)
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Transport: WebSocket clients with lazy reconnect
 # ══════════════════════════════════════════════════════════════════════════════
@@ -434,6 +452,7 @@ def find_gold_marker(mm_rgb, origin):
 
 _gold_latch_ang: Optional[float] = None   # last seen gold bearing (deg, minimap frame)
 _gold_latch_age: int = 0                  # ticks since the marker was last seen
+_last_gold_dist: Optional[float] = None   # radial px from centre to gold marker (None = absent)
 
 def _trail_dir(pool, origin, prev_heading, gold_ang):
     """Mean direction of a dot pool, rejecting the 'behind' cluster (came-from) so a
@@ -463,10 +482,12 @@ def path_heading(screen: Image.Image, prev_heading, save: bool = False):
       4. Wider trail / single dot — deep fallbacks. Else none (loop holds).
     Returns (heading_deg, n_near, conc, source). source 'path'|'gold'|'latch' = trust.
     """
-    global _gold_latch_ang, _gold_latch_age
+    global _gold_latch_ang, _gold_latch_age, _last_gold_dist
     dots, origin, _ = extract_dots(screen, save=False)
     mm_rgb = np.array(crop(screen, MINIMAP_REGION))
     gold_ang, gold_pt, gold_px = find_gold_marker(mm_rgb, origin)
+    _last_gold_dist = (math.hypot(gold_pt[0] - origin[0], gold_pt[1] - origin[1])
+                       if gold_pt is not None else None)
 
     # Maintain the gold latch: refresh on sight, otherwise age it out.
     if gold_ang is not None:
@@ -889,6 +910,60 @@ class StuckDetector:
         self.frames.clear()
 
 # ══════════════════════════════════════════════════════════════════════════════
+# Arrival detection — stop at the destination instead of overshooting
+# ══════════════════════════════════════════════════════════════════════════════
+
+class ArrivalDetector:
+    """Fed each exploration tick with the gold marker's radial distance (px from the
+    minimap centre, None if no marker) and the near-dot count. Returns True once we've
+    arrived at the active quest destination, so the loop can release and hold.
+
+    Arrival is gated on having entered the arrival ZONE first, then either reading
+    very-near or vanishing-with-no-trail for ARRIVAL_CONFIRM ticks. The gate is what
+    makes this robust: a marker that's merely occluded mid-field, or a far rim-clamped
+    target, never enters the zone and so can't trigger a false arrival. Once arrived,
+    we keep holding until a NEW far marker or a returning trail signals a next
+    objective (the latter also covers a rim-clamped new target that reads as no gold)."""
+
+    def __init__(self, mm_radius: float):
+        self.R = mm_radius
+        self.reset()
+
+    def update(self, gold_dist: Optional[float], n_near: int) -> bool:
+        near_r   = ARRIVAL_NEAR_FRAC   * self.R
+        zone_r   = ARRIVAL_RADIUS_FRAC * self.R
+        resume_r = ARRIVAL_RESUME_FRAC * self.R
+
+        # Already arrived → hold until there's clear evidence of a NEXT objective:
+        # a marker reappears far out, or the dotted trail comes back (new route drawn).
+        if self.arrived:
+            if (gold_dist is not None and gold_dist > resume_r) or n_near > ARRIVAL_MAX_DOTS:
+                self.reset()
+                return False
+            return True
+
+        if gold_dist is not None:
+            if gold_dist <= zone_r:
+                self.seen_close = True
+            if gold_dist > resume_r:            # marker jumped far → new objective, not arrival
+                self.reset()
+                return False
+
+        # Arrival conditions only count once we've actually been close.
+        cond = self.seen_close and (
+            (gold_dist is not None and gold_dist <= near_r) or      # very near, still drawn
+            (gold_dist is None and n_near <= ARRIVAL_MAX_DOTS))      # diamond→icon + trail gone
+        self.confirm = self.confirm + 1 if cond else 0
+        if self.confirm >= ARRIVAL_CONFIRM:
+            self.arrived = True
+        return self.arrived
+
+    def reset(self):
+        self.seen_close = False
+        self.confirm    = 0
+        self.arrived    = False
+
+# ══════════════════════════════════════════════════════════════════════════════
 # Startup checks
 # ══════════════════════════════════════════════════════════════════════════════
 
@@ -920,6 +995,7 @@ def check_services() -> bool:
 
 def run():
     sd = StuckDetector()
+    arrival = ArrivalDetector(_MM_R)
 
     print("UMA v8.0 — checking services...")
     if not check_services():
@@ -975,6 +1051,7 @@ def run():
         # Stop driving the moment we leave exploration
         if mode != "EXPLORATION" and last_mode == "EXPLORATION":
             release()
+            arrival.reset()        # re-evaluate arrival fresh on the next exploration entry
 
         # ── Loading ────────────────────────────────────────────────────────
         if mode == "LOADING":
@@ -991,7 +1068,7 @@ def run():
 
         if post_load and last_mode == "LOADING":
             print("  ✅ loaded — pausing 2s")
-            time.sleep(2); sd.reset(); post_load = False
+            time.sleep(2); sd.reset(); arrival.reset(); post_load = False
 
         # ── Cutscene ───────────────────────────────────────────────────────
         if mode == "CUTSCENE":
@@ -1064,6 +1141,19 @@ def run():
                 screen,
                 prev_heading=(math.degrees(math.atan2(sm_sin, sm_cos)) if sm_sin is not None else None),
                 save=(DEBUG_EVERY and tick % DEBUG_EVERY == 0))
+
+            # ── Arrival — stop before overshooting the destination ───────────
+            # _last_gold_dist (radial px to the marker, None if gone) was just set
+            # by path_heading. Once arrived we release and hold; resume is handled
+            # inside the detector (new far marker or a returning trail).
+            if ARRIVAL_ENABLE and arrival.update(_last_gold_dist, n_near):
+                release()
+                sm_sin = sm_cos = None                       # drop heading so we don't lurch on resume
+                gd = f"{_last_gold_dist:.0f}px" if _last_gold_dist is not None else "gone"
+                print(f"  🎯 ARRIVED — holding (gold {gd}, dots {n_near})")
+                last_mode = mode
+                time.sleep(max(0, TICK - (time.time() - t0)))
+                continue
 
             # Trust the trail ('path'), the gold bearing ('gold'), or its latch ('latch').
             trust = source in ("path", "gold", "latch")
