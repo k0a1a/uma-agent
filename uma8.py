@@ -193,11 +193,10 @@ SUBTITLE_REGION = ( 450, 655, 570,  55)
 CHOICE_REGION   = ( 865, 500, 360, 125)
 INTERACT_REGION = (  55, 350, 230, 120)
 ENEMY_HP_REGION = ( 650,  44, 580,  24)
-# Objective-distance (footprints) counter, just below-left of the minimap. A tight
-# box around the DIGITS only — clear of the 'CLEAR' weather box and sun/moon dial
-# (both upper-left). CALIBRATE with distance_raw.png and confirm the number DECREASES
-# as Geralt approaches; if it's static it's the Crowns counter, not distance — move it.
-DISTANCE_REGION = (1500, 204,  100,  30)    # STARTING GUESS @1920×1080
+# Objective-distance (footprints) counter, below-left of the minimap. Shows a number
+# in steps, or the word "NEARBY" when under ~10 steps from the objective. A tight box
+# around it, clear of the 'CLEAR' weather box and sun/moon dial above.
+DISTANCE_REGION = (1500, 204, 100,  30)    # verified @1920×1080
 
 # ── Auto-scale minimap-pixel constants to the configured minimap size ──────────
 # The dot/gold geometry above was tuned at a 213-px minimap. Scaling by the actual
@@ -290,7 +289,7 @@ ARRIVAL_MAX_DOTS    = 4       # near-dot count at/below which the trail counts a
 # game's own ground-truth distance, with none of the rim-clamp / centre-jitter
 # pathologies of the gold-pixel geometry). Pixel fracs above are the fallback.
 ARRIVAL_DIST_M      = 5       # arrived within this many metres of the objective
-ARRIVAL_ZONE_M      = 15      # within this we've "seen close" (arms the arrival)
+ARRIVAL_ZONE_M      = 20      # a numeric read within this arms the arrival (seen_close)
 ARRIVAL_RESUME_M    = 30      # beyond this after arriving = a new objective → resume
 _MM_R = min(MINIMAP_REGION[2], MINIMAP_REGION[3]) / 2.0   # minimap usable radius (px)
 GOLD_TRUST_MIN_DIST = GOLD_TRUST_MIN_FRAC * _MM_R         # px; below this the bearing is noise
@@ -1070,10 +1069,10 @@ class ArrivalDetector:
                 self.reset()
                 return False
             return True
-        if d <= ARRIVAL_ZONE_M:
-            self.seen_close = True
-        if d > ARRIVAL_RESUME_M:                     # marker jumped far → not arrival
-            self.reset()
+        if 0 < d <= ARRIVAL_ZONE_M:                  # a NUMERIC close read arms us; NEARBY
+            self.seen_close = True                   # (d==0) deliberately does NOT self-arm,
+        if d > ARRIVAL_RESUME_M:                     # so a stray false 'NEARBY' while far
+            self.reset()                             # (no prior count-down) can't fake arrival
             return False
         cond = self.seen_close and d <= ARRIVAL_DIST_M
         self.confirm = self.confirm + 1 if cond else 0
@@ -1185,9 +1184,19 @@ class DistanceReader:
         self.reset()
 
     def read(self, screen: Image.Image) -> Optional[int]:
-        raw    = ocr(crop(screen, DISTANCE_REGION))
-        digits = "".join(c for c in raw if c.isdigit())
+        raw = ocr(crop(screen, DISTANCE_REGION))
         self.age += 1
+
+        # "NEARBY" — the game's own "you're basically there" (< ~10 steps), shown
+        # INSTEAD of a number in the final stretch. It's the clearest arrival signal
+        # in the HUD, so treat it as distance 0. Fuzzy match (OCR may give NEAR8Y /
+        # NEAREY): letters-only, must start with NEAR — digits can't false-match this.
+        letters = "".join(c for c in raw.upper() if c.isalpha())
+        if letters.startswith("NEAR"):
+            self.last, self.age, self.pending = 0, 0, None
+            return 0
+
+        digits = "".join(c for c in raw if c.isdigit())
         val = int(digits) if digits else None
 
         if val is None or not (0 < val <= DISTANCE_MAX):
@@ -1431,8 +1440,9 @@ def run():
             if ARRIVAL_ENABLE and arrival.update(_last_gold_dist, n_near, dist_m):
                 release()
                 sm_sin = sm_cos = None                       # drop heading so we don't lurch on resume
-                gd = (f"{dist_m}m" if dist_m is not None
-                      else (f"{_last_gold_dist:.0f}px" if _last_gold_dist is not None else "gone"))
+                gd = ("NEARBY" if dist_m == 0 else
+                      f"{dist_m}m" if dist_m is not None else
+                      f"{_last_gold_dist:.0f}px" if _last_gold_dist is not None else "gone")
                 print(f"  🎯 ARRIVED — holding ({gd}, dots {n_near})")
                 last_mode = mode
                 time.sleep(max(0, TICK - (time.time() - t0)))
@@ -1515,7 +1525,8 @@ def run():
         vp_str = ("" if not VIEWPORT_AVOID else
                   f"  ⛞{vp_src} Δ{defl:+.0f}° clr={clearance:.2f}"
                   + (" BLOCK" if blocked_ahead else ""))
-        dm_str = f"  📏{dist_m}m" if dist_m is not None else ""
+        dm_str = ("" if dist_m is None else
+                  "  📏NEARBY" if dist_m == 0 else f"  📏{dist_m}m")
         print(f"  🗺  heading {heading:+.1f}° ({nav_str}{eb}){vp_str}{dm_str}  →  spd {speed:.2f}")
         move_dir(heading, speed)
 
