@@ -105,6 +105,9 @@ GOLD_RIM_FRAC   = 0.88        # ignore gold outside this fraction of radius (the
 GOLD_MIN_PIX    = 25          # min blob area to call it a marker
 GOLD_MIN_EXTENT = 0.35        # area / bbox — compact blob; rejects the thin arc
 GOLD_MAX_BBOX   = 45          # reject gold spans wider than this (arc / rim fragments)
+GOLD_SWITCH_RATIO = 1.5       # temporal coherence (Fix 2): switch off the tracked gold
+                              # blob only if another is this× bigger — else hold, so the
+                              # destination diamond and a quest icon stop flip-flopping
 
 # ── Steering law — LEFT-STICK DIRECTIONAL + NEAR-FIELD HEADING ────────────────
 # Heading is the direction of the IMMEDIATE path dots around Geralt, resolved
@@ -218,9 +221,11 @@ BODY_MASK_CENTRE = 0.50     # fraction across the region width where his body si
 BODY_MASK_WIDTH  = 0.16     # fraction of region width to blank
 BODY_MASK_BOTTOM = 0.55     # blank the centre only BELOW this row fraction (0=top)
 
-VIEW_FOV_DEG     = 70.0     # angular span the region WIDTH subtends (column→angle).
-                            # Perspective makes the map approximate; this is the
-                            # fudge knob — widen if deflections under-steer.
+VIEW_FOV_DEG     = 90.0     # angular span the region WIDTH subtends (column→angle).
+                            # Widened from 70 → 90: at 70 ~40% of frames fell beyond
+                            # ±35° and printed 'wide' (obstacle check skipped) right
+                            # when a hard turn needed guidance. Perspective makes the
+                            # map approximate; this is the fudge knob.
 N_SECTORS        = 24       # angular histogram resolution across VIEW_FOV_DEG
 NEAR_ROW_GAMMA   = 1.5      # weight lower (nearer) rows ∝ (row_frac)**this
 BLOCK_K          = 1.8      # a sector blocks above median·this (ADAPTIVE: a busy
@@ -229,6 +234,22 @@ BLOCK_FLOOR      = 0.06     # ...but never below this absolute (normalised 0..1)
                             # a near-empty frame isn't all "blocked" off noise
 AVOID_CONE_DEG   = 55.0     # most we'll deflect to dodge (never steer ~backwards)
 SLOW_ON_BLOCK    = 0.45     # speed × this while squeezing past / boxed in
+
+# ── Live-lock detection + commit-to-gap recovery (Fix 1) ──────────────────────
+# SSIM stuck-recovery only catches a FROZEN frame. A live-lock — Geralt micro-turning
+# at an obstacle, nibbling at a gap, frames changing but going nowhere (the 30s barn
+# oscillation) — slips past it. We count consecutive BLOCKED ticks; once that exceeds
+# LIVELOCK_TICKS we stop nibbling, pick the WIDEST clear gap in the viewport, and
+# COMMIT to it — drive straight through at full speed for COMMIT_TICKS, ignoring the
+# (oscillating) trail/gold input. If even the widest gap is too narrow it's a true
+# box-in and we leave it to SSIM back-off.
+LIVELOCK_TICKS   = 10       # consecutive blocked ticks before declaring a live-lock
+COMMIT_TICKS     = 6        # drive committed through the chosen gap for this many ticks
+COMMIT_SPEED     = 0.95     # full-ish speed through the gap (overrides SLOW_ON_BLOCK)
+COMMIT_MIN_GAP   = 8.0      # deg; widest gap must be at least this wide to commit forward
+GAP_CLEAR_FRAC   = 0.40     # widest-gap "clear" cut: e_min + this×(e_max−e_min). Range-
+                            # relative so it still finds the opening when a wall fills
+                            # most of the FOV (where the median-adaptive cut would miss it)
 
 # ── Arrival detection (stop instead of overshooting the destination) ──────────
 # The gold marker's RADIAL distance from the minimap centre shrinks as we approach
@@ -421,9 +442,17 @@ def _save_minimap_debug(mm_rgb, origin, all_dots, near_dots, heading, src, conc,
                 cv2.FONT_HERSHEY_SIMPLEX, 0.35, (255, 255, 0), 1)
     Image.fromarray(img).save("minimap_annotated.png")
 
-def find_gold_marker(mm_rgb, origin):
-    """Largest COMPACT gold blob's bearing (the diamond marker), or (None, None, 0).
-    Compactness rejects the thin curved quest-area arc and the rim ring."""
+def find_gold_marker(mm_rgb, origin, prev_ang=None):
+    """Bearing of the gold destination diamond, or (None, None, 0). Compactness
+    rejects the thin quest-area arc and the rim ring.
+
+    TEMPORAL COHERENCE (Fix 2): the minimap often shows TWO amber blobs — the
+    destination diamond AND a nearby quest/notice icon. Picking the largest each
+    frame flip-flops between them when their areas are close (the +4°/+30° square
+    wave that drove the barn oscillation). Instead, among the valid blobs we keep
+    the one nearest PREV_ANG (last frame's pick) and only switch to a different blob
+    if it's clearly bigger (GOLD_SWITCH_RATIO) — a more convincing marker. With no
+    prior we seed on the largest."""
     cx, cy = origin
     hsv  = cv2.cvtColor(mm_rgb, cv2.COLOR_RGB2HSV)
     mask = cv2.inRange(hsv, np.array(GOLD_HSV_LO), np.array(GOLD_HSV_HI))
@@ -434,7 +463,7 @@ def find_gold_marker(mm_rgb, origin):
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
 
     n, labels, stats, cents = cv2.connectedComponentsWithStats(mask)
-    best, best_area = None, 0
+    cands = []                                            # (bearing, area, pt)
     for i in range(1, n):
         area = stats[i, cv2.CC_STAT_AREA]
         if area < GOLD_MIN_PIX:
@@ -443,12 +472,21 @@ def find_gold_marker(mm_rgb, origin):
         extent = area / float(bw * bh) if bw * bh else 0.0
         if extent < GOLD_MIN_EXTENT or max(bw, bh) > GOLD_MAX_BBOX:   # reject arc / rim
             continue
-        if area > best_area:
-            best_area = area
-            best = (float(cents[i][0]), float(cents[i][1]))
-    if best is None:
+        pt = (float(cents[i][0]), float(cents[i][1]))
+        cands.append((_ang(origin, pt), float(area), pt))
+
+    if not cands:
         return None, None, 0
-    return _ang(origin, best), best, best_area
+
+    largest = max(cands, key=lambda c: c[1])
+    if prev_ang is None:
+        best = largest                                    # seed on the biggest blob
+    else:
+        nearest = min(cands, key=lambda c: abs(_ang_diff(c[0], prev_ang)))
+        # hold the tracked (nearest) blob unless the largest is clearly bigger
+        best = largest if (largest is not nearest and
+                           largest[1] > nearest[1] * GOLD_SWITCH_RATIO) else nearest
+    return best[0], best[2], best[1]
 
 _gold_latch_ang: Optional[float] = None   # last seen gold bearing (deg, minimap frame)
 _gold_latch_age: int = 0                  # ticks since the marker was last seen
@@ -485,7 +523,7 @@ def path_heading(screen: Image.Image, prev_heading, save: bool = False):
     global _gold_latch_ang, _gold_latch_age, _last_gold_dist
     dots, origin, _ = extract_dots(screen, save=False)
     mm_rgb = np.array(crop(screen, MINIMAP_REGION))
-    gold_ang, gold_pt, gold_px = find_gold_marker(mm_rgb, origin)
+    gold_ang, gold_pt, gold_px = find_gold_marker(mm_rgb, origin, prev_ang=_gold_latch_ang)
     _last_gold_dist = (math.hypot(gold_pt[0] - origin[0], gold_pt[1] - origin[1])
                        if gold_pt is not None else None)
 
@@ -631,6 +669,42 @@ def viewport_avoid(screen: Image.Image, desired: float, save: bool = False):
 
     if save: _save_viewport_debug(dbg, energy, blocked, desired, _SECTOR_ANG[best], "avoid")
     return _SECTOR_ANG[best], True, clearance, "avoid"
+
+def viewport_widest_gap(screen: Image.Image):
+    """For live-lock recovery: the centre bearing of the WIDEST contiguous run of
+    clear sectors, plus its angular width (deg). Returns (bearing, width_deg). When
+    nothing is clear, returns the single least-blocked sector with width 0.
+
+    Uses a RANGE-relative threshold, not viewport_avoid's median-adaptive one: with
+    a wall filling most of the FOV the median rides up with the wall and nothing
+    reads as blocked. During a live-lock we always want the best opening, so we
+    threshold off the energy range (clearest..most-blocked) and take the widest run
+    of the relatively-clearest sectors."""
+    energy, _ = viewport_histogram(screen)
+    e_min, e_max = float(energy.min()), float(energy.max())
+    thresh = e_min + GAP_CLEAR_FRAC * (e_max - e_min)
+    clear  = energy <= thresh
+    step   = VIEW_FOV_DEG / N_SECTORS
+
+    best_lo = best_len = -1
+    i = 0
+    while i < N_SECTORS:
+        if clear[i]:
+            j = i
+            while j < N_SECTORS and clear[j]:
+                j += 1
+            if (j - i) > best_len:
+                best_len, best_lo = j - i, i
+            i = j
+        else:
+            i += 1
+
+    if best_len <= 0:                                    # nothing clear — least-blocked sector
+        s = int(np.argmin(energy))
+        return _SECTOR_ANG[s], 0.0
+    centre_idx = best_lo + (best_len - 1) / 2.0
+    bearing = -VIEW_FOV_DEG / 2.0 + step * (centre_idx + 0.5)
+    return bearing, best_len * step
 
 def _save_viewport_debug(dbg, energy, blocked, desired, chosen, src):
     """viewport_annotated.png — sector bars (red=blocked, green=clear) over the crop,
@@ -1024,6 +1098,9 @@ def run():
     sm_sin = sm_cos = None        # smoothed heading vector (None until first trusted frame)
     edge_bias = 0.0               # lateral bias (deg) held after a stuck, to arc around
     edge_ticks = 0
+    blocked_streak = 0            # consecutive blocked ticks → live-lock detection (Fix 1)
+    commit_ticks   = 0            # ticks left driving a committed gap heading
+    commit_heading = 0.0          # the gap bearing we're committing to
 
     while True:
         tick += 1
@@ -1108,6 +1185,17 @@ def run():
             edge_bias  = side * EDGE_BIAS_DEG            # veer this way for a while...
             edge_ticks = EDGE_BIAS_TICKS                 # ...to arc around the obstacle
             sm_sin = sm_cos = None                       # drop stale heading after recovery
+            commit_ticks = 0                             # SSIM recovery supersedes a commit
+            time.sleep(max(0, TICK - (time.time() - t0)))
+            continue
+
+        # Commit-to-gap drive (Fix 1): after a live-lock we drive the chosen gap
+        # straight through at full speed for a few ticks, IGNORING the oscillating
+        # trail/gold input that caused the lock. SSIM (above) still supersedes.
+        if commit_ticks > 0:
+            commit_ticks -= 1
+            print(f"  🧭 commit {commit_heading:+.0f}° ({commit_ticks} left)  →  spd {COMMIT_SPEED:.2f}")
+            move_dir(commit_heading, COMMIT_SPEED)
             time.sleep(max(0, TICK - (time.time() - t0)))
             continue
 
@@ -1186,6 +1274,27 @@ def run():
                 screen, desired, save=(DEBUG_EVERY and tick % DEBUG_EVERY == 0))
         else:
             heading, blocked_ahead, clearance, vp_src = desired, False, 1.0, "off"
+
+        # ── Live-lock detection (Fix 1) — blocked tick after tick, going nowhere ─
+        # Counts consecutive blocked ticks. Past LIVELOCK_TICKS we stop nibbling at
+        # the obstacle and COMMIT to the widest clear gap (or, if even that's too
+        # narrow, hand off to the SSIM back-off). This is what breaks the barn-style
+        # oscillation that SSIM can't see because the frames keep changing.
+        blocked_streak = blocked_streak + 1 if blocked_ahead else 0
+        if blocked_streak >= LIVELOCK_TICKS:
+            gap_ang, gap_w = viewport_widest_gap(screen)
+            blocked_streak = 0
+            sm_sin = sm_cos = None                       # drop the oscillating heading
+            if gap_w >= COMMIT_MIN_GAP:
+                commit_heading, commit_ticks = gap_ang, COMMIT_TICKS
+                print(f"  🧭 LIVE-LOCK → commit gap {gap_ang:+.0f}° (w={gap_w:.0f}°) ×{COMMIT_TICKS}")
+                move_dir(commit_heading, COMMIT_SPEED)
+            else:
+                print(f"  🧱 LIVE-LOCK, no usable gap (w={gap_w:.0f}°) — back off")
+                side = sd.recover()
+                edge_bias, edge_ticks = side * EDGE_BIAS_DEG, EDGE_BIAS_TICKS
+            time.sleep(max(0, TICK - (time.time() - t0)))
+            continue
 
         # ── 3. Speed + drive ─────────────────────────────────────────────────
         base = 1.0 if not have else \
