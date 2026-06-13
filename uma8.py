@@ -291,6 +291,13 @@ ARRIVAL_MAX_DOTS    = 4       # near-dot count at/below which the trail counts a
 ARRIVAL_DIST_M      = 5       # arrived within this many metres of the objective
 ARRIVAL_ZONE_M      = 20      # a numeric read within this arms the arrival (seen_close)
 ARRIVAL_RESUME_M    = 30      # beyond this after arriving = a new objective → resume
+# Once within this distance the game shows the objective AREA RING instead of a gold
+# arrow (the ring grows and floods to a minimap-wide tint near the target). There is
+# NO destination marker in this regime, so gold is suppressed and we steer by the
+# trail, whose end is the ring centre = the target. Set to comfortably cover where the
+# ring appears (observed false-gold stalls were ≤33 steps; this leaves margin). Raise
+# if a false gold lock persists further out; lower if it drops gold too early.
+OBJECTIVE_AREA_M    = 40
 _MM_R = min(MINIMAP_REGION[2], MINIMAP_REGION[3]) / 2.0   # minimap usable radius (px)
 GOLD_TRUST_MIN_DIST = GOLD_TRUST_MIN_FRAC * _MM_R         # px; below this the bearing is noise
 
@@ -551,7 +558,8 @@ def _trail_dir(pool, origin, prev_heading, gold_ang):
     h, c = _circ_mean([angs[i] for i in use_idx])
     return h, c, [pool[i] for i in use_idx]
 
-def path_heading(screen: Image.Image, prev_heading, save: bool = False):
+def path_heading(screen: Image.Image, prev_heading, save: bool = False,
+                 dist_m: Optional[float] = None):
     """
     Combined heading. Priority:
       1. Near dotted TRAIL — routes around obstacles (forward = reject the behind cluster).
@@ -561,8 +569,18 @@ def path_heading(screen: Image.Image, prev_heading, save: bool = False):
          we walk in to the target instead of getting lost chasing dots.
       4. Wider trail / single dot — deep fallbacks. Else none (loop holds).
     Returns (heading_deg, n_near, conc, source). source 'path'|'gold'|'latch' = trust.
+
+    IN-AREA regime: once the objective-distance is small the game shows the AREA RING
+    (which grows and floods to tint near the target) INSTEAD of a gold arrow — so there
+    is NO destination marker, and any amber blob found is a false positive (a notice
+    icon / signpost). In that regime we suppress gold AND latch entirely and steer by
+    the TRAIL, whose end IS the target (the ring centre), relaxing the dot-count gate to
+    1 so the trail's sparse tail can drive.
     """
     global _gold_latch_ang, _gold_latch_age, _last_gold_dist
+    in_area  = dist_m is not None and dist_m <= OBJECTIVE_AREA_M
+    min_dots = 1 if in_area else MIN_DOTS_FOR_HEADING
+
     dots, origin, _ = extract_dots(screen, save=False)
     mm_rgb = np.array(crop(screen, MINIMAP_REGION))
     gold_ang, gold_pt, gold_px = find_gold_marker(mm_rgb, origin, prev_ang=_gold_latch_ang)
@@ -572,11 +590,10 @@ def path_heading(screen: Image.Image, prev_heading, save: bool = False):
     # Distance-gate the BEARING. Within GOLD_TRUST_MIN_DIST of centre the marker is
     # only a few px off-centre, so its ANGLE is noise — tiny centroid jitter swings it
     # wildly and flips it ~180° across centre (the corner-orbit failure). We keep the
-    # distance (arrival relies on it) but suppress the bearing so we don't steer by it:
-    # the latch (last trustworthy bearing, decaying to straight) walks us in and
-    # arrival stops us on the spot.
+    # distance (arrival relies on it) but suppress the bearing so we don't steer by it.
+    # IN-AREA we suppress gold outright: there is no arrow, only false amber blobs.
     gold_trusted = (gold_ang is not None and _last_gold_dist is not None
-                    and _last_gold_dist >= GOLD_TRUST_MIN_DIST)
+                    and _last_gold_dist >= GOLD_TRUST_MIN_DIST and not in_area)
     gold_use = gold_ang if gold_trusted else None
 
     # Maintain the gold latch: refresh on a TRUSTED sight, otherwise age it out.
@@ -598,34 +615,30 @@ def path_heading(screen: Image.Image, prev_heading, save: bool = False):
 
     heading, conc, src = None, 0.0, "none"
 
-    # 1. PRIMARY — the near dotted trail, but only when it's RELIABLE: enough dots
-    #    (MIN_DOTS_FOR_HEADING) AND angularly concentrated (CONC_MIN). The trail
-    #    routes around obstacles, so a TRUSTED trail outranks the straight gold
-    #    bearing. An UNRELIABLE trail (too few or scattered dots — the typical case
-    #    NEAR THE DESTINATION, where the gold diamond becomes the target icon and
-    #    the dots go sparse) must NOT pre-empt gold/latch, so it defers (Fix 3).
-    if len(near) >= MIN_DOTS_FOR_HEADING:
+    # 1. PRIMARY — the near dotted trail, when RELIABLE: enough dots (min_dots) AND
+    #    concentrated (CONC_MIN). The trail routes around obstacles, so a trusted trail
+    #    outranks the straight gold bearing. Out of area an unreliable thin trail defers
+    #    to gold (Fix 3); IN-AREA min_dots=1 so the trail's tail always wins (gold off).
+    if len(near) >= min_dots:
         h_n, c_n, near_kept = _trail_dir(near, origin, prev_heading, gold_use)
         if c_n >= CONC_MIN:
             heading, conc, near, src = h_n, c_n, near_kept, "path"
 
-    # 2–5. Trail not trusted → straight gold bearing, then its near-destination
-    #      latch, then a wider whole-map trail read, then whatever scattered dots
-    #      remain (untrusted → the loop holds the last heading).
+    # 2–5. Trail not trusted → gold bearing, then its latch, then a wider trail read,
+    #      then whatever dots remain. IN-AREA gold and latch are skipped (no marker
+    #      exists), so it goes straight to the wider/!any trail.
     if src != "path":
         if gold_use is not None:
             heading, conc, src = gold_use, 1.0, "gold"           # direct bearing
-        elif _gold_latch_ang is not None:                        # near destination: latch
+        elif _gold_latch_ang is not None and not in_area:        # near destination: latch
             decay = math.exp(-_gold_latch_age / GOLD_LATCH_TAU)  # turn-then-straighten
             heading, conc, src = _gold_latch_ang * decay, 1.0, "latch"
-        elif len(alld) >= MIN_DOTS_FOR_HEADING:                  # wider trail fallback
+        elif len(alld) >= min_dots:                              # wider trail fallback
             heading, conc, near = _trail_dir(alld, origin, prev_heading, gold_use)
             src = "path" if conc >= CONC_MIN else "spread"
-        elif len(near) >= 2:                                     # last resort: hold on it
+        elif len(near) >= 1:                                     # last resort: any dot
             heading, conc, near = _trail_dir(near, origin, prev_heading, gold_use)
-            src = "spread"
-        elif len(near) == 1:
-            heading, conc, src = _ang(origin, near[0]), 1.0, "one"
+            src = "path" if (in_area and conc >= CONC_MIN) else "spread"
 
     if save:
         _save_minimap_debug(mm_rgb, origin, dots, near, heading, src, conc, gold_pt)
@@ -1432,7 +1445,8 @@ def run():
             h_raw, n_near, conc, source = path_heading(
                 screen,
                 prev_heading=(math.degrees(math.atan2(sm_sin, sm_cos)) if sm_sin is not None else None),
-                save=(DEBUG_EVERY and tick % DEBUG_EVERY == 0))
+                save=(DEBUG_EVERY and tick % DEBUG_EVERY == 0),
+                dist_m=dist_m)
 
             # ── Arrival — stop before overshooting the destination ───────────
             # Prefer the metre distance (clean); _last_gold_dist is the pixel fallback.
