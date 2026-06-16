@@ -317,6 +317,14 @@ PROGRESS_EPS        = 6.0   # px; must close at least this much over the window,
 PROGRESS_RANGE      = 10.0  # px; if the distance also varied less than this it barely moved
                             # (flat = wall press); a detour has a large range and is spared
 PROGRESS_CLAMP_FRAC = 0.80  # ignore a rim-clamped far marker (its distance saturates there)
+# Metre-based stall (preferred when the objective distance is readable — covers the
+# IN-AREA 'wp'/'path' regime where the gold-pixel signal is the false scroll lock).
+# We track the best (minimum) objective distance reached; if no new best for STALL ticks
+# we're not progressing toward the goal. EPS_M=0.5 so any ≥1-step decrease counts as a
+# new best (distances are integer steps); robust to the value being held between the
+# 5-tick-gated reads (held value just doesn't beat best — no false reset).
+PROGRESS_EPS_M      = 0.5   # steps; a decrease of at least this is "progress"
+PROGRESS_STALL_TICKS = 25   # ticks with no new best distance ⇒ stalled (frozen run was 49)
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Transport: WebSocket clients with lazy reconnect
@@ -558,6 +566,42 @@ def _trail_dir(pool, origin, prev_heading, gold_ang):
     h, c = _circ_mean([angs[i] for i in use_idx])
     return h, c, [pool[i] for i in use_idx]
 
+def _chain_first_waypoint(dots, origin, prev_heading):
+    """Order the trail dots into a route and return the bearing to the FIRST waypoint —
+    the next step ALONG the path — for in-area navigation.
+
+    Why not just the nearest dot: at a corner the nearest dot by straight-line distance
+    can be a LATER waypoint across the obstacle, so aiming at it cuts the corner (and
+    wedges Geralt). Why not the blended mean (_trail_dir): same problem — it points at
+    where the path ENDS, not the next step along it.
+
+    Instead we reconstruct the route order: chain the dots nearest-neighbour from the FAR
+    end (farthest from Geralt — the route's far end, an unambiguous anchor) inward. The
+    Geralt-end of that chain is the first waypoint, correct even when Geralt is physically
+    closer to a later dot across a wall. As he reaches each dot it drops out (centre
+    exclusion) and the next becomes first, so per-tick rebuild advances the route.
+    Returns a bearing, or None if there's nothing usable."""
+    pts = list(dots)
+    # Drop the behind cluster (came-from) so the chain can't end on a dot behind us.
+    if prev_heading is not None and len(pts) >= 3:
+        behind = prev_heading + 180.0
+        kept = [p for p in pts if abs(_ang_diff(_ang(origin, p), behind)) > BEHIND_CONE]
+        if kept:
+            pts = kept
+    if not pts:
+        return None
+    if len(pts) == 1:
+        return _ang(origin, pts[0])
+
+    def d2(a, b): return (a[0] - b[0]) ** 2 + (a[1] - b[1]) ** 2
+    start = max(range(len(pts)), key=lambda i: d2(pts[i], origin))   # far end = route tip
+    chain, remaining = [start], set(range(len(pts))) - {start}
+    while remaining:                                                 # trace inward
+        last = chain[-1]
+        nxt = min(remaining, key=lambda i: d2(pts[i], pts[last]))
+        chain.append(nxt); remaining.discard(nxt)
+    return _ang(origin, pts[chain[-1]])                             # Geralt-end = next step
+
 def path_heading(screen: Image.Image, prev_heading, save: bool = False,
                  dist_m: Optional[float] = None):
     """
@@ -572,14 +616,15 @@ def path_heading(screen: Image.Image, prev_heading, save: bool = False,
 
     IN-AREA regime: once the objective-distance is small the game shows the AREA RING
     (which grows and floods to tint near the target) INSTEAD of a gold arrow — so there
+    IN-AREA regime: once the objective-distance is small the game shows the AREA RING
+    (which grows and floods to tint near the target) INSTEAD of a gold arrow — so there
     is NO destination marker, and any amber blob found is a false positive (a notice
     icon / signpost). In that regime we suppress gold AND latch entirely and steer by
-    the TRAIL, whose end IS the target (the ring centre), relaxing the dot-count gate to
-    1 so the trail's sparse tail can drive.
+    the TRAIL as an ORDERED ROUTE (_chain_first_waypoint), aiming at the first waypoint —
+    the trail's end is the target (the ring centre).
     """
     global _gold_latch_ang, _gold_latch_age, _last_gold_dist
-    in_area  = dist_m is not None and dist_m <= OBJECTIVE_AREA_M
-    min_dots = 1 if in_area else MIN_DOTS_FOR_HEADING
+    in_area = dist_m is not None and dist_m <= OBJECTIVE_AREA_M
 
     dots, origin, _ = extract_dots(screen, save=False)
     mm_rgb = np.array(crop(screen, MINIMAP_REGION))
@@ -615,30 +660,38 @@ def path_heading(screen: Image.Image, prev_heading, save: bool = False,
 
     heading, conc, src = None, 0.0, "none"
 
-    # 1. PRIMARY — the near dotted trail, when RELIABLE: enough dots (min_dots) AND
-    #    concentrated (CONC_MIN). The trail routes around obstacles, so a trusted trail
-    #    outranks the straight gold bearing. Out of area an unreliable thin trail defers
-    #    to gold (Fix 3); IN-AREA min_dots=1 so the trail's tail always wins (gold off).
-    if len(near) >= min_dots:
-        h_n, c_n, near_kept = _trail_dir(near, origin, prev_heading, gold_use)
-        if c_n >= CONC_MIN:
-            heading, conc, near, src = h_n, c_n, near_kept, "path"
+    if in_area:
+        # IN-AREA (objective ring, no gold arrow): follow the dotted trail as an ORDERED
+        # ROUTE, aiming at the FIRST waypoint (next step along the path) — not the nearest
+        # dot (corner-cut) nor the blended mean (also cuts the corner). Chain over ALL
+        # dots, since the route to the ring centre extends past R_NEAR.
+        wp = _chain_first_waypoint(alld, origin, prev_heading)
+        if wp is not None:
+            heading, conc, src = wp, 1.0, "wp"
+    else:
+        # 1. PRIMARY — near dotted trail, when RELIABLE (>=MIN_DOTS_FOR_HEADING AND
+        #    concentrated). A trusted trail outranks the straight gold bearing; a thin
+        #    unreliable one defers to gold (Fix 3).
+        if len(near) >= MIN_DOTS_FOR_HEADING:
+            h_n, c_n, near_kept = _trail_dir(near, origin, prev_heading, gold_use)
+            if c_n >= CONC_MIN:
+                heading, conc, near, src = h_n, c_n, near_kept, "path"
 
-    # 2–5. Trail not trusted → gold bearing, then its latch, then a wider trail read,
-    #      then whatever dots remain. IN-AREA gold and latch are skipped (no marker
-    #      exists), so it goes straight to the wider/!any trail.
-    if src != "path":
-        if gold_use is not None:
-            heading, conc, src = gold_use, 1.0, "gold"           # direct bearing
-        elif _gold_latch_ang is not None and not in_area:        # near destination: latch
-            decay = math.exp(-_gold_latch_age / GOLD_LATCH_TAU)  # turn-then-straighten
-            heading, conc, src = _gold_latch_ang * decay, 1.0, "latch"
-        elif len(alld) >= min_dots:                              # wider trail fallback
-            heading, conc, near = _trail_dir(alld, origin, prev_heading, gold_use)
-            src = "path" if conc >= CONC_MIN else "spread"
-        elif len(near) >= 1:                                     # last resort: any dot
-            heading, conc, near = _trail_dir(near, origin, prev_heading, gold_use)
-            src = "path" if (in_area and conc >= CONC_MIN) else "spread"
+        # 2–5. gold bearing → latch → wider trail → scattered dots.
+        if src != "path":
+            if gold_use is not None:
+                heading, conc, src = gold_use, 1.0, "gold"           # direct bearing
+            elif _gold_latch_ang is not None:                        # near destination: latch
+                decay = math.exp(-_gold_latch_age / GOLD_LATCH_TAU)  # turn-then-straighten
+                heading, conc, src = _gold_latch_ang * decay, 1.0, "latch"
+            elif len(alld) >= MIN_DOTS_FOR_HEADING:                  # wider trail fallback
+                heading, conc, near = _trail_dir(alld, origin, prev_heading, gold_use)
+                src = "path" if conc >= CONC_MIN else "spread"
+            elif len(near) >= 2:                                     # last resort: hold on it
+                heading, conc, near = _trail_dir(near, origin, prev_heading, gold_use)
+                src = "spread"
+            elif len(near) == 1:
+                heading, conc, src = _ang(origin, near[0]), 1.0, "one"
 
     if save:
         _save_minimap_debug(mm_rgb, origin, dots, near, heading, src, conc, gold_pt)
@@ -1144,9 +1197,30 @@ class ProgressDetector:
 
     def __init__(self):
         self.dists = deque(maxlen=PROGRESS_WINDOW)
+        self.best_m = None        # best (minimum) objective distance reached so far
+        self.stall_m = 0          # ticks since best_m last improved
+        self.mode = "px"
         self.side  = 1.0
 
-    def record(self, gold_dist: Optional[float], source: str, mm_radius: float):
+    def record(self, dist_m: Optional[float], gold_dist: Optional[float],
+               source: str, mm_radius: float):
+        nav = source in ("wp", "path", "gold", "latch")
+        # METRE path (preferred): the objective step-counter is clean and works for ANY
+        # steering source — crucially the in-area 'wp'/'path' regime, where the gold pixel
+        # is the false scroll lock. Track the best distance reached; if it stops improving
+        # we're not closing on the goal. Held-between-reads values simply don't beat best,
+        # so they neither falsely reset nor are needed every tick.
+        if dist_m is not None and nav:
+            self.mode = "m"
+            self.dists.clear()
+            if self.best_m is None or dist_m < self.best_m - PROGRESS_EPS_M:
+                self.best_m, self.stall_m = dist_m, 0
+            else:
+                self.stall_m += 1
+            return
+        # PIXEL fallback (no metre read): gold/latch only, windowed closure (original).
+        self.mode = "px"
+        self.best_m, self.stall_m = None, 0
         if source not in ("gold", "latch") or gold_dist is None \
            or gold_dist > PROGRESS_CLAMP_FRAC * mm_radius:
             self.dists.clear()
@@ -1154,6 +1228,8 @@ class ProgressDetector:
         self.dists.append(gold_dist)
 
     def stalled(self) -> bool:
+        if self.mode == "m":
+            return self.stall_m >= PROGRESS_STALL_TICKS   # no new best distance in STALL ticks
         if len(self.dists) < PROGRESS_WINDOW:
             return False
         net   = self.dists[0] - self.dists[-1]           # >0 = net closer over the window
@@ -1168,9 +1244,10 @@ class ProgressDetector:
         Deliberately NOT the viewport widest-gap — its histogram is blind to this wall,
         so it would just steer us back into it."""
         self.dists.clear()
+        self.best_m, self.stall_m = None, 0
         self.side = -self.side
         tag = "R" if self.side > 0 else "L"
-        print(f"  🧱 NO PROGRESS (gold not closing) — reverse + sidestep {tag}")
+        print(f"  🧱 NO PROGRESS (not closing) — reverse + sidestep {tag}")
         move_dir(180.0, 0.70);            time.sleep(0.35)   # back off the wall
         move_dir(self.side * 90.0, 0.90); time.sleep(0.40)   # sidestep along it
         release()
@@ -1178,6 +1255,7 @@ class ProgressDetector:
 
     def reset(self):
         self.dists.clear()
+        self.best_m, self.stall_m = None, 0
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Objective-distance reader — OCR the footprints/step counter, validated
@@ -1463,10 +1541,11 @@ def run():
                 continue
 
             # ── Progress — viewport-independent stall check ──────────────────
-            # Gold radial distance not closing while steering at the marker = blocked,
-            # even when the viewport reports clear (it's blind to this wall). Recover
-            # by reversing + sidestepping, then arc around via the edge bias.
-            progress.record(_last_gold_dist, source, _MM_R)
+            # Not closing on the objective = blocked, even when the viewport reports
+            # clear (it's blind to low-contrast/horizontal walls). Prefers the metre
+            # step-counter (covers the in-area 'wp'/'path' regime), falling back to the
+            # gold-pixel window. Recover by reversing + sidestepping, then arc via bias.
+            progress.record(dist_m, _last_gold_dist, source, _MM_R)
             if progress.stalled():
                 side = progress.recover()
                 edge_bias, edge_ticks = side * EDGE_BIAS_DEG, EDGE_BIAS_TICKS
@@ -1476,8 +1555,8 @@ def run():
                 time.sleep(max(0, TICK - (time.time() - t0)))
                 continue
 
-            # Trust the trail ('path'), the gold bearing ('gold'), or its latch ('latch').
-            trust = source in ("path", "gold", "latch")
+            # Trust the trail ('path'/'wp'), the gold bearing ('gold'), or latch ('latch').
+            trust = source in ("path", "wp", "gold", "latch")
             if trust:
                 s, c = math.sin(math.radians(h_raw)), math.cos(math.radians(h_raw))
                 if sm_sin is None:
